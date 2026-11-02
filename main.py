@@ -114,7 +114,7 @@ async def shutdown():
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_domain() -> str:
-    return os.environ.get("DOMAIN", "localhost")
+    return os.environ.get("DOMAIN", "johnsonpanel.wasmer.app")
 
 # ── Database Storage Helpers ──────────────────────────────────────────────────
 DB_FILE = os.environ.get("DB_PATH", "/data/db.json")
