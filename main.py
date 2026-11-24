@@ -5,6 +5,8 @@ import hashlib
 import secrets
 import time
 import re
+import base64
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
@@ -16,15 +18,9 @@ import uvicorn
 import httpx
 import logging
 import psutil
-try:
-    import psycopg2
-except ImportError:
-    psycopg2 = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("Luffy-Gateway")
-
-app = FastAPI(title="Luffy Panel", docs_url=None, redoc_url=None)
 
 CONFIG = {
     "port": int(os.environ.get("PORT", 20169)),
@@ -98,45 +94,40 @@ async def keep_alive():
         except Exception:
             pass
 
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global http_client
-    load_data()  # 1. Load your saved items first
+    await load_data()
     limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
     timeout = httpx.Timeout(30.0, connect=10.0)
     http_client = httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True)
-    asyncio.create_task(keep_alive())
-    asyncio.create_task(periodic_save_task())  # 2. Start the auto-saver loop
+    bg_keep_alive = asyncio.create_task(keep_alive())
+    bg_periodic_save = asyncio.create_task(periodic_save_task())
     await ensure_default_link()
+    try:
+        yield
+    finally:
+        bg_keep_alive.cancel()
+        bg_periodic_save.cancel()
+        logger.info("Server shutting down. Forcing final save...")
+        await save_data_to_disk()
+        if http_client:
+            await http_client.aclose()
 
-@app.on_event("shutdown")
-async def shutdown():
-    logger.info("Server shutting down. Forcing final save to db.json...")
-    await save_data_to_disk() # Forces a final save before turning off!
-    if http_client:
-        await http_client.aclose()
+app = FastAPI(title="Luffy Panel", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_domain() -> str:
     return os.environ.get("DOMAIN", "johnsonpanel.wasmer.app")
 
-# ── Database Storage Helpers (PostgreSQL + Local Fallback) ────────────────────
+# ── Database Storage Helpers (GitHub API via HTTPS + Local Fallback) ──────────
 DB_FILE = os.environ.get("DB_PATH", "/data/db.json")
-
-def _get_pg_conn():
-    if psycopg2 is None:
-        return None
-    host = os.environ.get("DB_HOST")
-    if not host:
-        return None
-    return psycopg2.connect(
-        host=host,
-        port=int(os.environ.get("DB_PORT", 5432)),
-        dbname=os.environ.get("DB_NAME", "postgres"),
-        user=os.environ.get("DB_USERNAME", "postgres"),
-        password=os.environ.get("DB_PASSWORD", ""),
-        connect_timeout=5,
-    )
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
+GITHUB_DB_PATH = os.environ.get("GITHUB_DB_PATH", "db.json").strip()
+GITHUB_FILE_SHA: str | None = None
+GITHUB_SAVE_LOCK = asyncio.Lock()
+LAST_SAVED_HASH: str = ""
 
 def _apply_loaded_dict(data: dict):
     LINKS.update(data.get("links", {}))
@@ -147,30 +138,38 @@ def _apply_loaded_dict(data: dict):
     stats["total_bytes"] = saved_stats.get("total_bytes", 0)
     stats["total_requests"] = saved_stats.get("total_requests", 0)
 
-def load_data():
-    # 1. Try PostgreSQL first (Wasmer Database)
-    try:
-        conn = _get_pg_conn()
-        if conn is not None:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "CREATE TABLE IF NOT EXISTS panel_kv (key TEXT PRIMARY KEY, value JSONB NOT NULL);"
-                    )
-                    cur.execute("SELECT value FROM panel_kv WHERE key = 'state';")
-                    row = cur.fetchone()
-                    if row and row[0]:
-                        data = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-                        _apply_loaded_dict(data)
-                        logger.info("Successfully loaded data from PostgreSQL database.")
-                    else:
-                        logger.info("PostgreSQL connected; initialized empty state table.")
-            conn.close()
-            return
-    except Exception as e:
-        logger.error(f"Failed to load data from PostgreSQL: {e}")
+def _gh_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
-    # 2. Fallback to local file if DB_HOST is not set
+async def load_data():
+    global GITHUB_FILE_SHA, LAST_SAVED_HASH
+    if GITHUB_TOKEN and GITHUB_REPO:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_DB_PATH}"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(url, headers=_gh_headers())
+                if r.status_code == 200:
+                    payload = r.json()
+                    GITHUB_FILE_SHA = payload.get("sha")
+                    raw_b64 = payload.get("content", "")
+                    decoded = base64.b64decode(raw_b64).decode("utf-8")
+                    data = json.loads(decoded)
+                    _apply_loaded_dict(data)
+                    LAST_SAVED_HASH = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+                    logger.info(f"Successfully loaded data from GitHub ({GITHUB_REPO}/{GITHUB_DB_PATH}).")
+                    return
+                elif r.status_code == 404:
+                    logger.info("GitHub db.json not found yet; will create on first save.")
+                    return
+                else:
+                    logger.error(f"GitHub load HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            logger.error(f"Failed to load data from GitHub: {e}")
+
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "r", encoding="utf-8") as f:
@@ -180,6 +179,7 @@ def load_data():
             logger.error(f"Failed to load data from disk: {e}")
 
 async def save_data_to_disk():
+    global GITHUB_FILE_SHA, LAST_SAVED_HASH
     try:
         async with LINKS_LOCK:
             links_copy = json.loads(json.dumps(LINKS))
@@ -196,41 +196,53 @@ async def save_data_to_disk():
             },
         }
 
-        def _write():
-            # Try PostgreSQL first
-            conn = _get_pg_conn()
-            if conn is not None:
-                try:
-                    with conn:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                "CREATE TABLE IF NOT EXISTS panel_kv (key TEXT PRIMARY KEY, value JSONB NOT NULL);"
-                            )
-                            cur.execute(
-                                '''
-                                INSERT INTO panel_kv (key, value)
-                                VALUES ('state', %s::jsonb)
-                                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
-                                ''',
-                                (json.dumps(data, ensure_ascii=False),),
-                            )
-                    conn.close()
-                    return
-                except Exception as pg_err:
-                    logger.error(f"PostgreSQL save error: {pg_err}")
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+        current_hash = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+        if current_hash == LAST_SAVED_HASH:
+            return
 
-            # Fallback to local disk
+        if GITHUB_TOKEN and GITHUB_REPO:
+            async with GITHUB_SAVE_LOCK:
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_DB_PATH}"
+                content_str = json.dumps(data, ensure_ascii=False, indent=2)
+                encoded_content = base64.b64encode(content_str.encode("utf-8")).decode("ascii")
+                body = {
+                    "message": "Update panel state",
+                    "content": encoded_content,
+                }
+                if GITHUB_FILE_SHA:
+                    body["sha"] = GITHUB_FILE_SHA
+
+                try:
+                    async with httpx.AsyncClient(timeout=12.0) as client:
+                        r = await client.put(url, headers=_gh_headers(), json=body)
+                        if r.status_code in (200, 201):
+                            GITHUB_FILE_SHA = r.json().get("content", {}).get("sha")
+                            LAST_SAVED_HASH = current_hash
+                            return
+                        elif r.status_code in (409, 422):
+                            # Refresh SHA if another instance updated the file
+                            g = await client.get(url, headers=_gh_headers())
+                            if g.status_code == 200:
+                                GITHUB_FILE_SHA = g.json().get("sha")
+                                body["sha"] = GITHUB_FILE_SHA
+                                r2 = await client.put(url, headers=_gh_headers(), json=body)
+                                if r2.status_code in (200, 201):
+                                    GITHUB_FILE_SHA = r2.json().get("content", {}).get("sha")
+                                    LAST_SAVED_HASH = current_hash
+                                    return
+                        logger.error(f"GitHub save HTTP {r.status_code}: {r.text[:200]}")
+                except Exception as gh_err:
+                    logger.error(f"GitHub save error: {gh_err}")
+
+        def _write_local():
             parent_dir = os.path.dirname(DB_FILE)
             if parent_dir:
                 os.makedirs(parent_dir, exist_ok=True)
             with open(DB_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
 
-        await asyncio.to_thread(_write)
+        await asyncio.to_thread(_write_local)
+        LAST_SAVED_HASH = current_hash
     except Exception as e:
         logger.error(f"Error saving data: {e}")
 
