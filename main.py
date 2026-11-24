@@ -156,6 +156,9 @@ async def save_data_to_disk():
         }
         
         def _write():
+            parent_dir = os.path.dirname(DB_FILE)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
             with open(DB_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
                 
@@ -332,7 +335,7 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
     return {"ok": True}   
 
 @app.get("/stats")
-async def get_stats():
+async def get_stats(_=Depends(require_auth)):
     try:
         cpu = psutil.cpu_percent(interval=0.1)
     except Exception:
@@ -348,10 +351,23 @@ async def get_stats():
     except Exception:
         disk = 0.0
 
+    async with connections_lock:
+        active_conns = len(connections)
+    async with LINKS_LOCK:
+        links_count = len(LINKS)
+
     return {
         "cpu_percent": cpu,
         "memory_percent": mem,
-        "disk_percent": disk
+        "disk_percent": disk,
+        "total_traffic_mb": round(stats["total_bytes"] / (1024 * 1024), 2),
+        "total_requests": stats["total_requests"],
+        "total_errors": stats["total_errors"],
+        "active_connections": active_conns,
+        "links_count": links_count,
+        "uptime": uptime(),
+        "domain": get_domain(),
+        "hourly_traffic": dict(hourly_traffic),
     }
 
 @app.post("/api/links")
@@ -475,6 +491,7 @@ async def add_address(request: Request, _=Depends(require_auth)):
         if address in CUSTOM_ADDRESSES:
             raise HTTPException(status_code=400, detail="Address already exists")
         CUSTOM_ADDRESSES.append(address)
+    await save_data_to_disk()
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
 
 @app.delete("/api/addresses/{index}")
