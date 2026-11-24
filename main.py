@@ -16,6 +16,10 @@ import uvicorn
 import httpx
 import logging
 import psutil
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("Luffy-Gateway")
@@ -116,25 +120,62 @@ async def shutdown():
 def get_domain() -> str:
     return os.environ.get("DOMAIN", "johnsonpanel.wasmer.app")
 
-# ── Database Storage Helpers ──────────────────────────────────────────────────
+# ── Database Storage Helpers (PostgreSQL + Local Fallback) ────────────────────
 DB_FILE = os.environ.get("DB_PATH", "/data/db.json")
 
+def _get_pg_conn():
+    if psycopg2 is None:
+        return None
+    host = os.environ.get("DB_HOST")
+    if not host:
+        return None
+    return psycopg2.connect(
+        host=host,
+        port=int(os.environ.get("DB_PORT", 5432)),
+        dbname=os.environ.get("DB_NAME", "postgres"),
+        user=os.environ.get("DB_USERNAME", "postgres"),
+        password=os.environ.get("DB_PASSWORD", ""),
+        connect_timeout=5,
+    )
+
+def _apply_loaded_dict(data: dict):
+    LINKS.update(data.get("links", {}))
+    CUSTOM_ADDRESSES.clear()
+    CUSTOM_ADDRESSES.extend(data.get("custom_addresses", ["www.speedtest.net"]))
+    AUTH.update(data.get("auth", {}))
+    saved_stats = data.get("stats", {})
+    stats["total_bytes"] = saved_stats.get("total_bytes", 0)
+    stats["total_requests"] = saved_stats.get("total_requests", 0)
+
 def load_data():
+    # 1. Try PostgreSQL first (Wasmer Database)
+    try:
+        conn = _get_pg_conn()
+        if conn is not None:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "CREATE TABLE IF NOT EXISTS panel_kv (key TEXT PRIMARY KEY, value JSONB NOT NULL);"
+                    )
+                    cur.execute("SELECT value FROM panel_kv WHERE key = 'state';")
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        data = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                        _apply_loaded_dict(data)
+                        logger.info("Successfully loaded data from PostgreSQL database.")
+                    else:
+                        logger.info("PostgreSQL connected; initialized empty state table.")
+            conn.close()
+            return
+    except Exception as e:
+        logger.error(f"Failed to load data from PostgreSQL: {e}")
+
+    # 2. Fallback to local file if DB_HOST is not set
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                LINKS.update(data.get("links", {}))
-                CUSTOM_ADDRESSES.clear()
-                CUSTOM_ADDRESSES.extend(data.get("custom_addresses", ["www.speedtest.net"]))
-                AUTH.update(data.get("auth", {}))
-                
-                # Load saved global traffic AND requests
-                saved_stats = data.get("stats", {})
-                stats["total_bytes"] = saved_stats.get("total_bytes", 0)
-                stats["total_requests"] = saved_stats.get("total_requests", 0)
-                
-            logger.info("Successfully loaded data from disk.")
+                _apply_loaded_dict(json.load(f))
+            logger.info("Successfully loaded data from local disk.")
         except Exception as e:
             logger.error(f"Failed to load data from disk: {e}")
 
@@ -144,27 +185,54 @@ async def save_data_to_disk():
             links_copy = json.loads(json.dumps(LINKS))
         async with CUSTOM_ADDRESSES_LOCK:
             addresses_copy = list(CUSTOM_ADDRESSES)
-        
+
         data = {
             "links": links_copy,
             "custom_addresses": addresses_copy,
             "auth": dict(AUTH),
             "stats": {
                 "total_bytes": stats["total_bytes"],
-                "total_requests": stats["total_requests"] # Save total requests here
-            }
+                "total_requests": stats["total_requests"],
+            },
         }
-        
+
         def _write():
+            # Try PostgreSQL first
+            conn = _get_pg_conn()
+            if conn is not None:
+                try:
+                    with conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "CREATE TABLE IF NOT EXISTS panel_kv (key TEXT PRIMARY KEY, value JSONB NOT NULL);"
+                            )
+                            cur.execute(
+                                '''
+                                INSERT INTO panel_kv (key, value)
+                                VALUES ('state', %s::jsonb)
+                                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+                                ''',
+                                (json.dumps(data, ensure_ascii=False),),
+                            )
+                    conn.close()
+                    return
+                except Exception as pg_err:
+                    logger.error(f"PostgreSQL save error: {pg_err}")
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+            # Fallback to local disk
             parent_dir = os.path.dirname(DB_FILE)
             if parent_dir:
                 os.makedirs(parent_dir, exist_ok=True)
             with open(DB_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
-                
+
         await asyncio.to_thread(_write)
     except Exception as e:
-        logger.error(f"Error saving data to disk: {e}")
+        logger.error(f"Error saving data: {e}")
 
 async def periodic_save_task():
     while True:
