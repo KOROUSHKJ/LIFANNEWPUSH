@@ -332,22 +332,26 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
     return {"ok": True}   
 
 @app.get("/stats")
-async def get_stats(_=Depends(require_auth)):
-    async with connections_lock:
-        conn_count = len(connections)
+async def get_stats():
+    try:
+        cpu = psutil.cpu_percent(interval=0.1)
+    except Exception:
+        cpu = 0.0
+
+    try:
+        mem = psutil.virtual_memory().percent
+    except Exception:
+        mem = 0.0
+
+    try:
+        disk = psutil.disk_usage('/data').percent
+    except Exception:
+        disk = 0.0
+
     return {
-        "active_connections": conn_count,
-        "total_traffic_mb": round(stats["total_bytes"] / (1024 * 1024), 2),
-        "total_requests": stats["total_requests"],
-        "total_errors": stats["total_errors"],
-        "uptime": uptime(),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "recent_errors": list(error_logs)[-10:],
-        "links_count": len(LINKS),
-        "domain": get_domain(),
-        "cpu_percent": psutil.cpu_percent(interval=0.1),
-        "memory_percent": psutil.virtual_memory().percent,
-        "hourly_traffic": dict(hourly_traffic),
+        "cpu_percent": cpu,
+        "memory_percent": mem,
+        "disk_percent": disk
     }
 
 @app.post("/api/links")
