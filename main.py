@@ -28,7 +28,6 @@ CONFIG = {
 }
 
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ── در-حافظه ────────────────────────────────────────────────────────────────
 connections: dict = {}
@@ -115,6 +114,7 @@ async def lifespan(app: FastAPI):
             await http_client.aclose()
 
 app = FastAPI(title="Luffy Panel", docs_url=None, redoc_url=None, lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_domain() -> str:
