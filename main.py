@@ -831,9 +831,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         stats["total_bytes"] += size
         stats["total_requests"] += 1
         
-        # Saves the request to db.json instantly!
-        asyncio.create_task(save_data_to_disk())
-        
+
         async with connections_lock:
             if conn_id in connections:
                 connections[conn_id]["bytes"] += size
